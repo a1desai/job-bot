@@ -35,7 +35,7 @@ SIMPLIFY_URL = (
 )
 
 # Only alert on these seasons (case-insensitive substring match against card text)
-TARGET_SEASONS = ["fall 2026"]
+TARGET_SEASONS = ["fall 2026", "summer 2026"]
 
 # Only alert if card text contains at least one of these keywords
 # (matches title or company name)
