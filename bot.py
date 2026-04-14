@@ -256,7 +256,7 @@ def fetch_postings() -> list[dict]:
     companies = [
         "Google", "Microsoft", "Amazon", "Meta", "Apple", "Shopify",
         "Stripe", "Cloudflare", "Databricks", "OpenAI", "Anthropic",
-        "TD-Bank", "RBC", "Nvidia", "TikTok", "Ramp", "Figma",
+        "TD-Bank", "Royal-Bank-of-Canada", "Nvidia", "TikTok", "Ramp", "Figma",
         "Palantir", "Waymo", "Scale-AI", "Cohere", "Wealthsimple",
     ]
 
