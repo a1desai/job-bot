@@ -213,23 +213,14 @@ def format_message(company: str, title: str, lines: list[str], details: dict, jo
     return "\n".join(lines_out)
 
 
-async def scrape_jobs(browser) -> list[dict]:
-    """Open Simplify, return list of job dicts."""
-    page = await browser.new_page()
-    await page.set_extra_http_headers({
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-    })
-
+async def scrape_jobs(page) -> list[dict]:
+    """Load Simplify on an existing page and return list of job dicts."""
     try:
         await page.goto(SIMPLIFY_URL, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_selector('[data-testid="job-card"]', timeout=15000)
         await asyncio.sleep(2)
     except Exception as e:
         print(f"  [page load error] {e}")
-        await page.close()
         return []
 
     # Get job ID from the auto-selected first card (it's in the URL)
@@ -275,48 +266,31 @@ async def scrape_jobs(browser) -> list[dict]:
             "button":  job_buttons[i] if i < len(job_buttons) else None,
         })
 
-    await page.close()
     return jobs
 
 
-async def get_job_id_by_clicking(browser, job: dict) -> str:
-    """Click a job card in a fresh page to get its jobId from the URL."""
+async def get_job_id_by_clicking(page, job: dict) -> str:
+    """Click a job card on an already-loaded page to get its jobId from the URL."""
     if job.get("job_id"):
         return job["job_id"]
-
-    page = await browser.new_page()
-    await page.set_extra_http_headers({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    })
     try:
-        await page.goto(SIMPLIFY_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_selector('[data-testid="job-card"]', timeout=15000)
-        await asyncio.sleep(2)
-
-        # Find and click the matching card
         cards = await page.query_selector_all('[data-testid="job-card"]')
         for card in cards:
             text = await card.inner_text()
             if job["company"] in text and job["title"] in text:
                 await card.click()
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 m = re.search(r'/p/([a-f0-9-]+)/', page.url)
                 if m:
-                    await page.close()
                     return m.group(1)
                 break
     except Exception as e:
         print(f"  [click error] {e}")
-    finally:
-        try:
-            await page.close()
-        except:
-            pass
     return ""
 
 
-async def check_once(browser, seen: set) -> tuple[set, int]:
-    jobs = await scrape_jobs(browser)
+async def check_once(page, seen: set) -> tuple[set, int]:
+    jobs = await scrape_jobs(page)
     if not jobs:
         return seen, 0
 
@@ -330,10 +304,10 @@ async def check_once(browser, seen: set) -> tuple[set, int]:
         if not matches_season(job["text"]) or not matches_keywords(job["text"]):
             continue
 
-        # Get job ID (click to navigate if needed)
-        job_id = await get_job_id_by_clicking(browser, job)
+        # Get job ID by clicking the card on the already-loaded page
+        job_id = await get_job_id_by_clicking(page, job)
 
-        # Fetch full details if we have an ID
+        # Fetch full details via API
         details = fetch_job_details(job_id) if job_id else {}
 
         msg = format_message(job["company"], job["title"], job["lines"], details, job_id)
@@ -362,12 +336,40 @@ async def main():
     )
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--no-zygote",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-translate",
+                "--hide-scrollbars",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
+            ]
+        )
+        # Single persistent page — reused every poll to save memory
+        page = await browser.new_page()
+        await page.set_extra_http_headers({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        })
+
         seen = load_seen()
 
         if not seen:
             print("\nFirst run — seeding current listings...")
-            jobs = await scrape_jobs(browser)
+            jobs = await scrape_jobs(page)
             for job in jobs:
                 seen.add(job_key(job["company"], job["title"]))
             save_seen(seen)
@@ -375,7 +377,7 @@ async def main():
 
         while True:
             ts = datetime.now().strftime("%H:%M:%S")
-            seen, n = await check_once(browser, seen)
+            seen, n = await check_once(page, seen)
             save_seen(seen)
             print(f"[{ts}] Checked Simplify — {n} new alert(s). Total tracked: {len(seen)}")
             await asyncio.sleep(POLL_INTERVAL)
