@@ -1,0 +1,6 @@
+venv/
+seen_jobs.json
+bot.log
+nohup.out
+__pycache__/
+*.pyc
