@@ -1,1 +1,1 @@
-playwright==1.58.0
+# No external dependencies — uses Python stdlib only

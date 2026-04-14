@@ -1,75 +1,67 @@
 #!/usr/bin/env python3
 """
 Simplify.jobs → Telegram Job Alert Bot
-Monitors Simplify for Fall/Summer 2026 AI/ML + SWE internships every 60 seconds.
-Fetches full job details and matches against Aryan's resume.
+No browser needed — uses Simplify's public API directly.
+Polls every 60 seconds. Runs on any free cloud tier.
 """
 
-import asyncio
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright
-
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-SIMPLIFY_URL = (
-    "https://simplify.jobs/jobs"
-    "?jobType=Internship"
-    "&category=Software%20Engineering%3BData%20%26%20Analytics"
-)
-
-TARGET_SEASONS = ["fall 2026", "summer 2026"]
+TARGET_SEASONS   = ["fall 2026", "summer 2026"]
+POLL_INTERVAL    = 60
+SEEN_FILE        = Path(__file__).parent / "seen_jobs.json"
 
 KEYWORD_FILTER = [
     "software engineer", "software developer", "swe", "full stack", "fullstack",
     "backend", "frontend", "front-end", "back-end", "web developer",
     "machine learning", "ml engineer", "ai engineer", "artificial intelligence",
     "deep learning", "data scientist", "data engineer", "nlp", "computer vision",
-    "research engineer", "applied scientist",
-    "engineer intern", "engineering intern",
+    "research engineer", "applied scientist", "engineer intern", "engineering intern",
 ]
 
-POLL_INTERVAL = 60
-SEEN_FILE     = Path(__file__).parent / "seen_jobs.json"
-
-# ── ARYAN'S RESUME SKILLS ────────────────────────────────────────────────────
-# Used for match scoring against job requirements
+# ── ARYAN'S RESUME SKILLS ─────────────────────────────────────────────────────
 RESUME_SKILLS = {
-    # Languages
     "javascript", "typescript", "python", "java", "c++", "c/c++",
-    # AI/ML
     "pytorch", "reinforcement learning", "rag", "langchain", "langgraph",
     "machine learning", "nlp", "transformers", "llm", "large language model",
-    "gcp", "vertex ai", "gcp vertex ai",
-    # Frameworks & Tools
+    "gcp", "vertex ai",
     "react", "next.js", "nextjs", "node.js", "nodejs", "express", "express.js",
     "postgresql", "postgres", "rest", "restful api", "tailwind", "tailwind css",
     "jwt", "supabase", "git", "docker", "firebase", "aws", "aws s3",
     "jest", "ci/cd", "github actions",
-    # Concepts
     "full stack", "fullstack", "backend", "frontend", "api", "web development",
-    "reinforcement learning", "rl", "deep learning", "computer vision",
-    "rag pipeline", "embeddings", "vector database", "pgvector",
+    "deep learning", "computer vision", "rag pipeline", "embeddings", "pgvector",
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
+HEADERS = {
+    "Accept":     "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Origin":     "https://simplify.jobs",
+    "Referer":    "https://simplify.jobs/",
 }
 
-RESUME_EXPERIENCE = """
-- AI Project Lead at Computing Councils of Canada: LangGraph, Docker, cybersecurity AI agents
-- Software Engineer at FlipPilot: TypeScript, Playwright, GPT-4, PostgreSQL, HTML parsing
-- Technology Director at Google Developer Groups: React, TypeScript, workshops
-- Projects: EchoBase (React, Node.js, Supabase, LLM), BeaverBuddy (Next.js, PostgreSQL, OpenAI),
-  AI Racer (PyTorch, RL, GDScript), SentinAI (transformers, RAG, NLP)
-- Education: TMU Computer Science Co-op (2024–2029)
-"""
-# ─────────────────────────────────────────────────────────────────────────────
+
+def api_get(url: str) -> dict | list | None:
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"  [API error] {url[:80]} — {e}")
+        return None
 
 
 def load_seen() -> set:
@@ -88,7 +80,7 @@ def send_telegram(text: str):
         "chat_id":                  TELEGRAM_CHAT_ID,
         "text":                     text,
         "parse_mode":               "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }).encode()
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}
@@ -102,8 +94,8 @@ def send_telegram(text: str):
         print(f"[Telegram error] {e}")
 
 
-def job_key(company: str, title: str) -> str:
-    return re.sub(r"\s+", " ", f"{company}|{title}").lower().strip()
+def job_key(job_id: str) -> str:
+    return job_id.lower().strip()
 
 
 def matches_keywords(text: str) -> bool:
@@ -111,36 +103,15 @@ def matches_keywords(text: str) -> bool:
     return any(kw in t for kw in KEYWORD_FILTER)
 
 
-def matches_season(text: str) -> bool:
-    t = text.lower()
-    if not any(s in t for s in ["summer", "fall", "spring", "winter"]):
-        return True
-    return any(s in t for s in TARGET_SEASONS)
-
-
-def fetch_job_details(job_id: str) -> dict:
-    """Fetch full job details from Simplify API."""
-    url = f"https://api.simplify.jobs/v2/job-posting/:id/{job_id}/company"
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Origin": "https://simplify.jobs",
-        "Referer": "https://simplify.jobs/",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
-    except Exception as e:
-        print(f"  [detail fetch error] {e}")
-        return {}
+def matches_season(seasons: list) -> bool:
+    """seasons is a list like [{'name': 'Fall 2026'}, ...]"""
+    if not seasons:
+        return True  # no season listed = always include
+    season_names = [s.get("name", "").lower() for s in seasons]
+    return any(t in name for t in TARGET_SEASONS for name in season_names)
 
 
 def score_match(details: dict) -> tuple[str, str, list[str]]:
-    """
-    Returns (match_label, match_emoji, matched_skills).
-    Compares job requirements/skills against resume.
-    """
-    # Collect all text from the job posting
     job_text = " ".join([
         details.get("title", ""),
         details.get("description", ""),
@@ -149,20 +120,16 @@ def score_match(details: dict) -> tuple[str, str, list[str]]:
         " ".join(s.get("name", "") for s in details.get("skills", [])),
     ]).lower()
 
-    # Find which resume skills appear in the job text
     matched = [skill for skill in RESUME_SKILLS if skill in job_text]
     matched_display = [s.title() for s in sorted(set(matched))]
 
-    # Score based on match count relative to job's skill demands
-    total_skills_in_job = len(re.findall(
+    total = max(len(re.findall(
         r'\b(?:python|javascript|typescript|react|node|java|c\+\+|sql|aws|docker|'
         r'pytorch|tensorflow|machine learning|nlp|api|git|ci/cd|kubernetes)\b',
         job_text
-    ))
-    total_skills_in_job = max(total_skills_in_job, 1)
+    )), 1)
 
-    score = len(matched) / min(total_skills_in_job, 10)
-
+    score = len(matched) / min(total, 10)
     if score >= 0.7 or len(matched) >= 6:
         return "Perfect Match", "🟢", matched_display
     elif score >= 0.4 or len(matched) >= 3:
@@ -173,158 +140,159 @@ def score_match(details: dict) -> tuple[str, str, list[str]]:
         return "Low Match", "🔴", matched_display
 
 
-def format_message(company: str, title: str, lines: list[str], details: dict, job_id: str) -> str:
-    season   = next((l for l in lines if any(s in l for s in ["2026", "2027", "Internship"])), "")
-    salary   = next((l for l in lines if "$" in l), "")
-    location = next((l for l in lines if "," in l or "Remote" in l), "")
+def format_message(details: dict) -> str:
+    title    = details.get("title", "Unknown Role")
+    company  = (details.get("job") or {}).get("company", {}).get("name", "Unknown Company")
+    seasons  = details.get("seasons", [])
+    season   = ", ".join(s.get("name", "") for s in seasons) if seasons else "Internship"
+    locs     = details.get("locations", [])
+    location = locs[0].get("name", "") if locs else ""
+    min_sal  = details.get("min_salary")
+    max_sal  = details.get("max_salary")
+    currency = details.get("currency_type", "USD")
+    period   = details.get("salary_period", "")
+    salary   = ""
+    if min_sal and max_sal:
+        salary = f"{currency} ${min_sal:,.0f}–${max_sal:,.0f}/{period or 'yr'}"
+    elif min_sal:
+        salary = f"{currency} ${min_sal:,.0f}/{period or 'yr'}"
 
-    # Match scoring
+    job_id   = details.get("id", "")
+    slug     = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    job_url  = f"https://simplify.jobs/p/{job_id}/{slug}"
+
     match_label, match_emoji, matched_skills = score_match(details)
-
-    # Required skills from API
-    api_skills = [s.get("name", "") for s in details.get("skills", [])][:8]
+    api_skills = [s.get("name", "") for s in details.get("skills", [])][:6]
     skills_str = ", ".join(api_skills) if api_skills else "Not listed"
 
-    # Job URL
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    job_url = f"https://simplify.jobs/p/{job_id}/{slug}" if job_id else \
-              f"https://simplify.jobs/jobs?search={urllib.parse.quote_plus(f'{company} {title}')}&jobType=Internship"
-
-    lines_out = []
-    lines_out.append("━━━━━━━━━━━━━━━━━━━━━━")
-    lines_out.append(f"🔔  <b>NEW INTERNSHIP ALERT</b>")
-    lines_out.append("━━━━━━━━━━━━━━━━━━━━━━")
-    lines_out.append(f"\n<b>{title}</b>")
-    lines_out.append(f"<i>{company}</i>")
-    lines_out.append("")
-    if season:   lines_out.append(f"🗓  <b>Season</b>    <i>{season}</i>")
-    if location: lines_out.append(f"📍  <b>Location</b>  <i>{location}</i>")
-    if salary:   lines_out.append(f"💰  <b>Pay</b>       <i>{salary}</i>")
-    lines_out.append("")
-    lines_out.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-    lines_out.append(f"{match_emoji}  <b>Resume Match — {match_label}</b>")
-    lines_out.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+    lines = []
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔔  <b>NEW INTERNSHIP ALERT</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"\n<b>{title}</b>")
+    lines.append(f"<i>{company}</i>\n")
+    if season:   lines.append(f"🗓  <b>Season</b>    <i>{season}</i>")
+    if location: lines.append(f"📍  <b>Location</b>  <i>{location}</i>")
+    if salary:   lines.append(f"💰  <b>Pay</b>       <i>{salary}</i>")
+    lines.append("")
+    lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+    lines.append(f"{match_emoji}  <b>Resume Match — {match_label}</b>")
+    lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
     if matched_skills:
-        lines_out.append(f"✅  <b>Your skills:</b>  <i>{', '.join(matched_skills[:6])}</i>")
-    lines_out.append(f"🛠  <b>Required:</b>     <i>{skills_str}</i>")
-    lines_out.append("")
-    lines_out.append(f"🔗  <a href=\"{job_url}\"><b>View on Simplify →</b></a>")
-    lines_out.append("━━━━━━━━━━━━━━━━━━━━━━")
-    return "\n".join(lines_out)
+        lines.append(f"✅  <b>Your skills:</b>  <i>{', '.join(matched_skills[:6])}</i>")
+    lines.append(f"🛠  <b>Required:</b>     <i>{skills_str}</i>")
+    lines.append("")
+    lines.append(f"🔗  <a href=\"{job_url}\"><b>View on Simplify →</b></a>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
 
 
-async def scrape_jobs(page) -> list[dict]:
-    """Load Simplify on an existing page and return list of job dicts."""
-    try:
-        await page.goto(SIMPLIFY_URL, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_selector('[data-testid="job-card"]', timeout=15000)
-        await asyncio.sleep(2)
-    except Exception as e:
-        print(f"  [page load error] {e}")
+def fetch_job_listings(size: int = 50) -> list[dict]:
+    """
+    Fetch job postings from Simplify's public job-list API.
+    Uses the curated internship lists which are publicly accessible.
+    """
+    # Get all job lists tagged as internship
+    lists_url = f"https://api.simplify.jobs/v2/job-list/?page=1&size=100&value="
+    data = api_get(lists_url)
+    if not data or not data.get("items"):
         return []
 
-    # Get job ID from the auto-selected first card (it's in the URL)
-    first_job_id = ""
-    url_match = re.search(r'jobId=([a-f0-9-]+)', page.url)
-    if url_match:
-        first_job_id = url_match.group(1)
+    # Filter to internship lists
+    internship_lists = [
+        item for item in data["items"]
+        if item.get("internship") or "intern" in item.get("title", "").lower()
+           or "co-op" in item.get("title", "").lower()
+    ]
 
-    raw_jobs = await page.evaluate('''() => {
-        const cards = document.querySelectorAll('[data-testid="job-card"]');
-        const jobs = [];
-        for (const card of cards) {
-            const lines = card.innerText
-                .split("\\n")
-                .map(l => l.trim())
-                .filter(Boolean);
-            if (lines.length >= 2) {
-                jobs.push(lines);
-            }
-        }
-        return jobs;
-    }''')
+    all_postings = []
+    seen_ids = set()
 
-    # For each new job card, click it to get its jobId from the URL
-    job_buttons = await page.query_selector_all('[data-testid="job-card"]')
-
-    jobs = []
-    for i, lines in enumerate(raw_jobs):
-        company = lines[0] if lines else ""
-        title   = lines[1] if len(lines) > 1 else ""
-        if not company or not title:
+    for lst in internship_lists[:10]:  # check top 10 internship lists
+        list_id = lst["id"]
+        url = (
+            f"https://api.simplify.jobs/v2/job-list/:id/{list_id}"
+            f"/job-with-job-posting/active?page=1&size={size}&value="
+        )
+        result = api_get(url)
+        if not result or not result.get("items"):
             continue
+        for item in result["items"]:
+            posting = item.get("job_posting") or item
+            pid = posting.get("id")
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                all_postings.append(posting)
 
-        # First card's ID is already in URL
-        job_id = first_job_id if i == 0 else ""
-
-        jobs.append({
-            "company": company,
-            "title":   title,
-            "lines":   lines,
-            "text":    " ".join(lines),
-            "job_id":  job_id,
-            "button":  job_buttons[i] if i < len(job_buttons) else None,
-        })
-
-    return jobs
+    return all_postings
 
 
-async def get_job_id_by_clicking(page, job: dict) -> str:
-    """Click a job card on an already-loaded page to get its jobId from the URL."""
-    if job.get("job_id"):
-        return job["job_id"]
-    try:
-        cards = await page.query_selector_all('[data-testid="job-card"]')
-        for card in cards:
-            text = await card.inner_text()
-            if job["company"] in text and job["title"] in text:
-                await card.click()
-                await asyncio.sleep(1)
-                m = re.search(r'/p/([a-f0-9-]+)/', page.url)
-                if m:
-                    return m.group(1)
-                break
-    except Exception as e:
-        print(f"  [click error] {e}")
-    return ""
+def fetch_recent_postings() -> list[dict]:
+    """
+    Directly fetch recent job postings using the company search + posting endpoint.
+    Falls back to job-list approach.
+    """
+    # Try fetching from known active job lists
+    postings = fetch_job_listings()
+
+    # Also try fetching individual job details for SWE/AI roles via company search
+    if not postings:
+        print("  [warn] job-list approach returned nothing, trying company search...")
+        companies = ["Google", "Microsoft", "Amazon", "Meta", "Apple", "Shopify",
+                     "TD Bank", "RBC", "Stripe", "Cloudflare", "Databricks"]
+        for company in companies:
+            url = f"https://api.simplify.jobs/v2/company/?page=1&size=3&value={urllib.parse.quote(company)}&workflow_completed=true"
+            result = api_get(url)
+            if result and result.get("items"):
+                for c in result["items"][:1]:
+                    cid = c.get("id")
+                    if cid:
+                        jp_url = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=5"
+                        jp = api_get(jp_url)
+                        if jp and jp.get("items"):
+                            postings.extend(jp["items"])
+
+    return postings
 
 
-async def check_once(page, seen: set) -> tuple[set, int]:
-    jobs = await scrape_jobs(page)
-    if not jobs:
+def check_once(seen: set) -> tuple[set, int]:
+    postings = fetch_recent_postings()
+    if not postings:
+        print("  [warn] No postings returned from API")
         return seen, 0
 
     new_count = 0
-    for job in jobs:
-        key = job_key(job["company"], job["title"])
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if not matches_season(job["text"]) or not matches_keywords(job["text"]):
+    for posting in postings:
+        pid = posting.get("id") or posting.get("tracked_obj") or ""
+        if not pid or job_key(pid) in seen:
             continue
 
-        # Get job ID by clicking the card on the already-loaded page
-        job_id = await get_job_id_by_clicking(page, job)
+        title = posting.get("title", "")
+        seasons = posting.get("seasons", [])
+        card_text = title + " " + " ".join(s.get("name","") for s in seasons)
 
-        # Fetch full details via API
-        details = fetch_job_details(job_id) if job_id else {}
+        if not matches_keywords(card_text):
+            continue
+        if not matches_season(seasons):
+            continue
 
-        msg = format_message(job["company"], job["title"], job["lines"], details, job_id)
-        print(f"  [ALERT] {job['company']} — {job['title']} ({job_id or 'no id'})")
+        seen.add(job_key(pid))
+        msg = format_message(posting)
+        company = (posting.get("job") or {}).get("company", {}).get("name", "?")
+        print(f"  [ALERT] {company} — {title}")
         send_telegram(msg)
         new_count += 1
 
     return seen, new_count
 
 
-async def main():
+def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("ERROR: Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID before running.")
         return
 
     print("=" * 60)
-    print("  Simplify.jobs → Telegram Bot")
+    print("  Simplify.jobs → Telegram Bot (API mode, no browser)")
     print(f"  Target: Summer/Fall 2026 SWE / AI / ML Internships")
     print(f"  Polling every {POLL_INTERVAL}s")
     print("=" * 60)
@@ -335,53 +303,25 @@ async def main():
         "Each alert includes a <b>match score</b> based on your resume 🎯"
     )
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-                "--no-zygote",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--disable-translate",
-                "--hide-scrollbars",
-                "--metrics-recording-only",
-                "--mute-audio",
-                "--no-first-run",
-                "--safebrowsing-disable-auto-update",
-            ]
-        )
-        # Single persistent page — reused every poll to save memory
-        page = await browser.new_page()
-        await page.set_extra_http_headers({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            )
-        })
+    seen = load_seen()
 
-        seen = load_seen()
+    if not seen:
+        print("\nFirst run — seeding current listings (no alerts yet)...")
+        postings = fetch_recent_postings()
+        for p in postings:
+            pid = p.get("id") or p.get("tracked_obj") or ""
+            if pid:
+                seen.add(job_key(pid))
+        save_seen(seen)
+        print(f"Seeded {len(seen)} jobs. Future new postings will trigger alerts.\n")
 
-        if not seen:
-            print("\nFirst run — seeding current listings...")
-            jobs = await scrape_jobs(page)
-            for job in jobs:
-                seen.add(job_key(job["company"], job["title"]))
-            save_seen(seen)
-            print(f"Seeded {len(seen)} jobs. Future new postings will trigger alerts.\n")
-
-        while True:
-            ts = datetime.now().strftime("%H:%M:%S")
-            seen, n = await check_once(page, seen)
-            save_seen(seen)
-            print(f"[{ts}] Checked Simplify — {n} new alert(s). Total tracked: {len(seen)}")
-            await asyncio.sleep(POLL_INTERVAL)
+    while True:
+        ts = datetime.now().strftime("%H:%M:%S")
+        seen, n = check_once(seen)
+        save_seen(seen)
+        print(f"[{ts}] Checked Simplify — {n} new alert(s). Total tracked: {len(seen)}")
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
