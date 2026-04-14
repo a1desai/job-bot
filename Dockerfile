@@ -7,4 +7,5 @@ RUN pip install -r requirements.txt
 
 COPY bot.py .
 
-CMD ["python", "bot.py"]
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "-u", "bot.py"]

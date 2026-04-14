@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
 Simplify.jobs → Telegram Job Alert Bot
-No browser needed — uses Simplify's public API directly.
-Polls every 60 seconds. Runs on any free cloud tier.
+No browser — uses Simplify's public API directly.
+Runs a tiny health-check HTTP server so Railway keeps it alive.
 """
 
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+PORT             = int(os.environ.get("PORT", 8080))
 
 TARGET_SEASONS   = ["fall 2026", "summer 2026"]
 POLL_INTERVAL    = 60
@@ -54,7 +57,24 @@ HEADERS = {
 }
 
 
-def api_get(url: str) -> dict | list | None:
+# ── TINY HEALTH CHECK SERVER (keeps Railway alive) ────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Job bot is running")
+    def log_message(self, *_):
+        pass  # suppress access logs
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Health server listening on port {PORT}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def api_get(url: str):
     req = urllib.request.Request(url, headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
@@ -94,8 +114,38 @@ def send_telegram(text: str):
         print(f"[Telegram error] {e}")
 
 
-def job_key(job_id: str) -> str:
-    return job_id.lower().strip()
+def parse_seasons(seasons_raw) -> list[str]:
+    """Safely extract season strings regardless of API shape."""
+    if not seasons_raw:
+        return []
+    result = []
+    for s in seasons_raw:
+        if isinstance(s, str):
+            result.append(s.lower())
+        elif isinstance(s, dict):
+            val = s.get("name") or s.get("value") or s.get("label") or ""
+            result.append(str(val).lower())
+        elif isinstance(s, list):
+            result.extend(parse_seasons(s))
+    return result
+
+
+def matches_season(seasons_raw) -> bool:
+    seasons = parse_seasons(seasons_raw)
+    if not seasons:
+        return True  # no season = always include
+    return any(t in s for t in TARGET_SEASONS for s in seasons)
+
+
+def is_internship(posting: dict) -> bool:
+    """Only return true for actual internship/co-op postings."""
+    title = (posting.get("title") or "").lower()
+    # Must be entry level
+    if not posting.get("entry_level") and not posting.get("internship_flag"):
+        # Still allow if title explicitly says intern/co-op/coop/student
+        if not any(w in title for w in ["intern", "co-op", "coop", "student", "new grad", "university grad"]):
+            return False
+    return True
 
 
 def matches_keywords(text: str) -> bool:
@@ -103,21 +153,21 @@ def matches_keywords(text: str) -> bool:
     return any(kw in t for kw in KEYWORD_FILTER)
 
 
-def matches_season(seasons: list) -> bool:
-    """seasons is a list like [{'name': 'Fall 2026'}, ...]"""
-    if not seasons:
-        return True  # no season listed = always include
-    season_names = [s.get("name", "").lower() for s in seasons]
-    return any(t in name for t in TARGET_SEASONS for name in season_names)
-
-
 def score_match(details: dict) -> tuple[str, str, list[str]]:
+    def to_str(val):
+        if isinstance(val, list):
+            return " ".join(str(v) for v in val)
+        return str(val) if val else ""
+
     job_text = " ".join([
-        details.get("title", ""),
-        details.get("description", ""),
-        details.get("requirements", ""),
-        details.get("responsibilities", ""),
-        " ".join(s.get("name", "") for s in details.get("skills", [])),
+        to_str(details.get("title")),
+        to_str(details.get("description")),
+        to_str(details.get("requirements")),
+        to_str(details.get("responsibilities")),
+        " ".join(
+            (s.get("name") if isinstance(s, dict) else str(s))
+            for s in details.get("skills", [])
+        ),
     ]).lower()
 
     matched = [skill for skill in RESUME_SKILLS if skill in job_text]
@@ -142,28 +192,42 @@ def score_match(details: dict) -> tuple[str, str, list[str]]:
 
 def format_message(details: dict) -> str:
     title    = details.get("title", "Unknown Role")
-    company  = (details.get("job") or {}).get("company", {}).get("name", "Unknown Company")
-    seasons  = details.get("seasons", [])
-    season   = ", ".join(s.get("name", "") for s in seasons) if seasons else "Internship"
+    job_info = details.get("job") or {}
+    company  = job_info.get("company", {}).get("name", "") if isinstance(job_info, dict) else ""
+    if not company:
+        company = details.get("company_name", "Unknown Company")
+
+    seasons_raw = details.get("seasons", [])
+    seasons     = parse_seasons(seasons_raw)
+    season_str  = ", ".join(s.title() for s in seasons) if seasons else "Internship"
+
     locs     = details.get("locations", [])
-    location = locs[0].get("name", "") if locs else ""
+    location = ""
+    if locs and isinstance(locs[0], dict):
+        location = locs[0].get("value") or locs[0].get("name", "")
+
     min_sal  = details.get("min_salary")
     max_sal  = details.get("max_salary")
     currency = details.get("currency_type", "USD")
-    period   = details.get("salary_period", "")
+    period   = details.get("salary_period", "yr")
     salary   = ""
     if min_sal and max_sal:
-        salary = f"{currency} ${min_sal:,.0f}–${max_sal:,.0f}/{period or 'yr'}"
+        salary = f"{currency} ${min_sal:,.0f}–${max_sal:,.0f}/{period}"
     elif min_sal:
-        salary = f"{currency} ${min_sal:,.0f}/{period or 'yr'}"
+        salary = f"{currency} ${min_sal:,.0f}/{period}"
 
-    job_id   = details.get("id", "")
-    slug     = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    job_url  = f"https://simplify.jobs/p/{job_id}/{slug}"
+    job_id  = details.get("id", "")
+    slug    = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    job_url = f"https://simplify.jobs/p/{job_id}/{slug}" if job_id else \
+              f"https://simplify.jobs/jobs?search={urllib.parse.quote_plus(f'{company} {title}')}&jobType=Internship"
 
     match_label, match_emoji, matched_skills = score_match(details)
-    api_skills = [s.get("name", "") for s in details.get("skills", [])][:6]
-    skills_str = ", ".join(api_skills) if api_skills else "Not listed"
+    api_skills = details.get("skills", [])
+    skill_names = [
+        (s.get("name") if isinstance(s, dict) else str(s))
+        for s in api_skills[:6]
+    ]
+    skills_str = ", ".join(filter(None, skill_names)) or "Not listed"
 
     lines = []
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
@@ -171,9 +235,9 @@ def format_message(details: dict) -> str:
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"\n<b>{title}</b>")
     lines.append(f"<i>{company}</i>\n")
-    if season:   lines.append(f"🗓  <b>Season</b>    <i>{season}</i>")
-    if location: lines.append(f"📍  <b>Location</b>  <i>{location}</i>")
-    if salary:   lines.append(f"💰  <b>Pay</b>       <i>{salary}</i>")
+    if season_str: lines.append(f"🗓  <b>Season</b>    <i>{season_str}</i>")
+    if location:   lines.append(f"📍  <b>Location</b>  <i>{location}</i>")
+    if salary:     lines.append(f"💰  <b>Pay</b>       <i>{salary}</i>")
     lines.append("")
     lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
     lines.append(f"{match_emoji}  <b>Resume Match — {match_label}</b>")
@@ -187,98 +251,77 @@ def format_message(details: dict) -> str:
     return "\n".join(lines)
 
 
-def fetch_job_listings(size: int = 50) -> list[dict]:
-    """
-    Fetch job postings from Simplify's public job-list API.
-    Uses the curated internship lists which are publicly accessible.
-    """
-    # Get all job lists tagged as internship
-    lists_url = f"https://api.simplify.jobs/v2/job-list/?page=1&size=100&value="
-    data = api_get(lists_url)
-    if not data or not data.get("items"):
-        return []
-
-    # Filter to internship lists
-    internship_lists = [
-        item for item in data["items"]
-        if item.get("internship") or "intern" in item.get("title", "").lower()
-           or "co-op" in item.get("title", "").lower()
+def fetch_postings() -> list[dict]:
+    """Fetch internship postings by scanning top tech/finance companies."""
+    companies = [
+        "Google", "Microsoft", "Amazon", "Meta", "Apple", "Shopify",
+        "Stripe", "Cloudflare", "Databricks", "OpenAI", "Anthropic",
+        "TD-Bank", "RBC", "Nvidia", "TikTok", "Ramp", "Figma",
+        "Palantir", "Waymo", "Scale-AI", "Cohere", "Wealthsimple",
     ]
 
     all_postings = []
     seen_ids = set()
 
-    for lst in internship_lists[:10]:  # check top 10 internship lists
-        list_id = lst["id"]
-        url = (
-            f"https://api.simplify.jobs/v2/job-list/:id/{list_id}"
-            f"/job-with-job-posting/active?page=1&size={size}&value="
-        )
-        result = api_get(url)
+    for slug in companies:
+        url = f"https://api.simplify.jobs/v2/company/:slug/{slug}"
+        company_data = api_get(url)
+        if not company_data or "id" not in company_data:
+            continue
+
+        cid = company_data["id"]
+        url2 = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=20"
+        result = api_get(url2)
         if not result or not result.get("items"):
             continue
-        for item in result["items"]:
-            posting = item.get("job_posting") or item
-            pid = posting.get("id")
-            if pid and pid not in seen_ids:
+
+        for posting in result["items"]:
+            pid = posting.get("id") or posting.get("tracked_obj", "")
+            if pid and pid not in seen_ids and posting.get("active"):
                 seen_ids.add(pid)
+                # Inject company name since it's not always in the posting
+                if not posting.get("job"):
+                    posting["company_name"] = company_data.get("name", slug)
                 all_postings.append(posting)
 
+    print(f"  Fetched {len(all_postings)} active postings from {len(companies)} companies")
     return all_postings
 
 
-def fetch_recent_postings() -> list[dict]:
-    """
-    Directly fetch recent job postings using the company search + posting endpoint.
-    Falls back to job-list approach.
-    """
-    # Try fetching from known active job lists
-    postings = fetch_job_listings()
-
-    # Also try fetching individual job details for SWE/AI roles via company search
-    if not postings:
-        print("  [warn] job-list approach returned nothing, trying company search...")
-        companies = ["Google", "Microsoft", "Amazon", "Meta", "Apple", "Shopify",
-                     "TD Bank", "RBC", "Stripe", "Cloudflare", "Databricks"]
-        for company in companies:
-            url = f"https://api.simplify.jobs/v2/company/?page=1&size=3&value={urllib.parse.quote(company)}&workflow_completed=true"
-            result = api_get(url)
-            if result and result.get("items"):
-                for c in result["items"][:1]:
-                    cid = c.get("id")
-                    if cid:
-                        jp_url = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=5"
-                        jp = api_get(jp_url)
-                        if jp and jp.get("items"):
-                            postings.extend(jp["items"])
-
-    return postings
-
-
 def check_once(seen: set) -> tuple[set, int]:
-    postings = fetch_recent_postings()
-    if not postings:
-        print("  [warn] No postings returned from API")
-        return seen, 0
-
+    postings = fetch_postings()
     new_count = 0
+
     for posting in postings:
-        pid = posting.get("id") or posting.get("tracked_obj") or ""
-        if not pid or job_key(pid) in seen:
+        pid = posting.get("id") or posting.get("tracked_obj", "")
+        if not pid or pid in seen:
             continue
 
-        title = posting.get("title", "")
-        seasons = posting.get("seasons", [])
-        card_text = title + " " + " ".join(s.get("name","") for s in seasons)
+        title       = posting.get("title", "")
+        seasons_raw = posting.get("seasons", [])
+        desc        = posting.get("description", "") or ""
+        card_text   = f"{title} {desc[:200]}"
 
+        # Add season info from description if seasons field is empty
+        if not seasons_raw:
+            for season in ["Summer 2026", "Fall 2026", "Spring 2026", "Winter 2026"]:
+                if season.lower() in desc.lower():
+                    seasons_raw = [season]
+                    break
+
+        seen.add(pid)
+
+        if not is_internship(posting):
+            continue
         if not matches_keywords(card_text):
             continue
-        if not matches_season(seasons):
+        if not matches_season(seasons_raw):
             continue
 
-        seen.add(job_key(pid))
+        posting["seasons"] = seasons_raw  # inject parsed seasons back
         msg = format_message(posting)
-        company = (posting.get("job") or {}).get("company", {}).get("name", "?")
+        company = (posting.get("job") or {}).get("company", {}).get("name") \
+                  or posting.get("company_name", "?")
         print(f"  [ALERT] {company} — {title}")
         send_telegram(msg)
         new_count += 1
@@ -291,8 +334,10 @@ def main():
         print("ERROR: Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID before running.")
         return
 
+    start_health_server()
+
     print("=" * 60)
-    print("  Simplify.jobs → Telegram Bot (API mode, no browser)")
+    print("  Simplify.jobs → Telegram Bot")
     print(f"  Target: Summer/Fall 2026 SWE / AI / ML Internships")
     print(f"  Polling every {POLL_INTERVAL}s")
     print("=" * 60)
@@ -307,11 +352,11 @@ def main():
 
     if not seen:
         print("\nFirst run — seeding current listings (no alerts yet)...")
-        postings = fetch_recent_postings()
+        postings = fetch_postings()
         for p in postings:
-            pid = p.get("id") or p.get("tracked_obj") or ""
+            pid = p.get("id") or p.get("tracked_obj", "")
             if pid:
-                seen.add(job_key(pid))
+                seen.add(pid)
         save_seen(seen)
         print(f"Seeded {len(seen)} jobs. Future new postings will trigger alerts.\n")
 
@@ -319,7 +364,7 @@ def main():
         ts = datetime.now().strftime("%H:%M:%S")
         seen, n = check_once(seen)
         save_seen(seen)
-        print(f"[{ts}] Checked Simplify — {n} new alert(s). Total tracked: {len(seen)}")
+        print(f"[{ts}] Checked — {n} new alert(s). Total tracked: {len(seen)}")
         time.sleep(POLL_INTERVAL)
 
 
