@@ -190,18 +190,27 @@ def format_message(company: str, title: str, lines: list[str], details: dict, jo
     job_url = f"https://simplify.jobs/p/{job_id}/{slug}" if job_id else \
               f"https://simplify.jobs/jobs?search={urllib.parse.quote_plus(f'{company} {title}')}&jobType=Internship"
 
-    parts = [f"🔔 <b>New Internship Alert!</b>\n"]
-    parts.append(f"<b>{title}</b>")
-    parts.append(f"🏢 {company}")
-    if season:   parts.append(f"🗓 {season}")
-    if salary:   parts.append(f"💰 {salary}")
-    if location: parts.append(f"📍 {location}")
-    parts.append(f"\n{match_emoji} <b>{match_label}</b>")
+    lines_out = []
+    lines_out.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines_out.append(f"🔔  <b>NEW INTERNSHIP ALERT</b>")
+    lines_out.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines_out.append(f"\n<b>{title}</b>")
+    lines_out.append(f"<i>{company}</i>")
+    lines_out.append("")
+    if season:   lines_out.append(f"🗓  <b>Season</b>    <i>{season}</i>")
+    if location: lines_out.append(f"📍  <b>Location</b>  <i>{location}</i>")
+    if salary:   lines_out.append(f"💰  <b>Pay</b>       <i>{salary}</i>")
+    lines_out.append("")
+    lines_out.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+    lines_out.append(f"{match_emoji}  <b>Resume Match — {match_label}</b>")
+    lines_out.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
     if matched_skills:
-        parts.append(f"✅ Your skills: {', '.join(matched_skills[:6])}")
-    parts.append(f"🛠 Required: {skills_str}")
-    parts.append(f"\n<a href=\"{job_url}\">View on Simplify →</a>")
-    return "\n".join(parts)
+        lines_out.append(f"✅  <b>Your skills:</b>  <i>{', '.join(matched_skills[:6])}</i>")
+    lines_out.append(f"🛠  <b>Required:</b>     <i>{skills_str}</i>")
+    lines_out.append("")
+    lines_out.append(f"🔗  <a href=\"{job_url}\"><b>View on Simplify →</b></a>")
+    lines_out.append("━━━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines_out)
 
 
 async def scrape_jobs(browser) -> list[dict]:
