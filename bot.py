@@ -278,6 +278,10 @@ def fetch_postings() -> list[dict]:
         cid = company_data["id"]
         url2 = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=50&active=true"
         result = api_get(url2)
+        # Some companies (Amazon, Meta, Apple) return 500 with active=true — fall back
+        if not result or not result.get("items"):
+            url2 = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=20"
+            result = api_get(url2)
         if not result or not result.get("items"):
             continue
 
