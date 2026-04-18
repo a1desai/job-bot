@@ -25,6 +25,7 @@ PORT             = int(os.environ.get("PORT", 8080))
 TARGET_SEASONS   = ["fall 2026", "summer 2026"]
 POLL_INTERVAL    = 60
 SEEN_FILE        = Path(__file__).parent / "seen_jobs.json"
+SALARY_PERIOD_MAP = {1: "hr", 2: "wk", 3: "mo", 4: "yr"}
 
 KEYWORD_FILTER = [
     "software engineer", "software developer", "swe", "full stack", "fullstack",
@@ -138,14 +139,10 @@ def matches_season(seasons_raw) -> bool:
 
 
 def is_internship(posting: dict) -> bool:
-    """Only return true for actual internship/co-op postings."""
+    """Return True only for actual internship/co-op postings."""
     title = (posting.get("title") or "").lower()
-    # Must be entry level
-    if not posting.get("entry_level") and not posting.get("internship_flag"):
-        # Still allow if title explicitly says intern/co-op/coop/student
-        if not any(w in title for w in ["intern", "co-op", "coop", "student", "new grad", "university grad"]):
-            return False
-    return True
+    intern_words = ["intern", "co-op", "coop", "student", "new grad", "university grad"]
+    return any(w in title for w in intern_words)
 
 
 def matches_keywords(text: str) -> bool:
@@ -174,8 +171,9 @@ def score_match(details: dict) -> tuple[str, str, list[str]]:
     matched_display = [s.title() for s in sorted(set(matched))]
 
     total = max(len(re.findall(
-        r'\b(?:python|javascript|typescript|react|node|java|c\+\+|sql|aws|docker|'
-        r'pytorch|tensorflow|machine learning|nlp|api|git|ci/cd|kubernetes)\b',
+        r'\b(?:python|javascript|typescript|react|node\.?js|java|c\+\+|sql|aws|docker|'
+        r'pytorch|tensorflow|machine.?learning|nlp|api|git|ci/?cd|kubernetes|'
+        r'langchain|langgraph|rag|next\.?js|gcp|postgresql|supabase)\b',
         job_text
     )), 1)
 
@@ -193,7 +191,9 @@ def score_match(details: dict) -> tuple[str, str, list[str]]:
 def format_message(details: dict) -> str:
     title    = details.get("title", "Unknown Role")
     job_info = details.get("job") or {}
-    company  = job_info.get("company", {}).get("name", "") if isinstance(job_info, dict) else ""
+    company  = ""
+    if isinstance(job_info, dict) and job_info:
+        company = (job_info.get("company") or {}).get("name", "")
     if not company:
         company = details.get("company_name", "Unknown Company")
 
@@ -206,10 +206,13 @@ def format_message(details: dict) -> str:
     if locs and isinstance(locs[0], dict):
         location = locs[0].get("value") or locs[0].get("name", "")
 
-    min_sal  = details.get("min_salary")
-    max_sal  = details.get("max_salary")
+    try:
+        min_sal = float(details.get("min_salary") or 0) or None
+        max_sal = float(details.get("max_salary") or 0) or None
+    except (TypeError, ValueError):
+        min_sal = max_sal = None
     currency = details.get("currency_type", "USD")
-    period   = details.get("salary_period", "yr")
+    period   = SALARY_PERIOD_MAP.get(details.get("salary_period"), "yr")
     salary   = ""
     if min_sal and max_sal:
         salary = f"{currency} ${min_sal:,.0f}–${max_sal:,.0f}/{period}"
@@ -259,6 +262,9 @@ def fetch_postings() -> list[dict]:
         "TD-Bank", "Royal-Bank-of-Canada", "Nvidia", "TikTok", "Ramp", "Figma",
         "Palantir", "Waymo", "Scale-AI", "Cohere", "Wealthsimple",
     ]
+    extra = os.environ.get("EXTRA_COMPANIES", "")
+    extra_companies = [c.strip() for c in extra.split(",") if c.strip()]
+    companies = companies + extra_companies
 
     all_postings = []
     seen_ids = set()
@@ -270,7 +276,7 @@ def fetch_postings() -> list[dict]:
             continue
 
         cid = company_data["id"]
-        url2 = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=20"
+        url2 = f"https://api.simplify.jobs/v2/company/:id/{cid}/job-posting?page=1&size=50&active=true"
         result = api_get(url2)
         if not result or not result.get("items"):
             continue
@@ -279,11 +285,12 @@ def fetch_postings() -> list[dict]:
             pid = posting.get("id") or posting.get("tracked_obj", "")
             if pid and pid not in seen_ids and posting.get("active"):
                 seen_ids.add(pid)
-                # Inject company name since it's not always in the posting
-                if not posting.get("job"):
-                    posting["company_name"] = company_data.get("name", slug)
+                # Always inject so format_message can use it as fallback
+                posting["company_name"] = company_data.get("name", slug)
                 all_postings.append(posting)
 
+    if len(all_postings) == 0:
+        print("  WARNING: All company fetches returned 0 active postings — check API or network.")
     print(f"  Fetched {len(all_postings)} active postings from {len(companies)} companies")
     return all_postings
 
